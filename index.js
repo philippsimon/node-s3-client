@@ -485,6 +485,31 @@ Client.prototype.copyObject = function(_s3Params) {
   return ee;
 };
 
+Client.prototype.headObject = function(_s3Params) {
+  var self = this;
+  var ee = new EventEmitter();
+  var s3Params = extend({}, _s3Params);
+  doWithRetry(doHeadWithPend, self.s3RetryCount, self.s3RetryDelay, function(err, data) {
+    if (err) {
+      ee.emit('error', err);
+    } else {
+      ee.emit('end', data);
+    }
+  });
+  function doHeadWithPend(cb) {
+    self.s3Pend.go(function(pendCb) {
+      doTheHead(function(err, data) {
+        pendCb();
+        cb(err, data);
+      });
+    });
+  }
+  function doTheHead(cb) {
+    self.s3.headObject(s3Params, cb);
+  }
+  return ee;
+};
+
 Client.prototype.moveObject = function(s3Params) {
   var self = this;
   var ee = new EventEmitter();
