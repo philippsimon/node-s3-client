@@ -150,15 +150,39 @@ Creates an S3 client.
  * `s3RetryCount` - how many times to try an S3 operation before giving up.
  * `s3RetryDelay` - how many milliseconds to wait before retrying an S3 operation.
 
-### s3.getPublicUrl(bucket, key, [insecure])
+### s3.getPublicUrl(bucket, key, [bucketLocation])
 
  * `bucket` S3 bucket
  * `key` S3 key
- * `insecure` boolean, whether to use http or https. defaults to false.
+ * `bucketLocation` string, one of these:
+   - "" (default) - US Standard
+   - "eu-west-1"
+   - "us-west-1"
+   - "us-west-2"
+   - "ap-southeast-1"
+   - "ap-southeast-2"
+   - "ap-northeast-1"
+   - "sa-east-1"
+
+You can find out your bucket location programatically by using this API:
+http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/S3.html#getBucketLocation-property
 
 returns a string which looks like this:
 
 `https://s3.amazonaws.com/bucket/key`
+
+or maybe this if you are not in US Standard:
+
+`https://s3-eu-west-1.amazonaws.com/bucket/key`
+
+### s3.getPublicUrlHttp(bucket, key)
+
+ * `bucket` S3 Bucket
+ * `key` S3 Key
+
+Works for any region, and returns a string which looks like this:
+
+`http://bucket.s3.amazonaws.com/key`
 
 ### client.uploadFile(params)
 
@@ -430,6 +454,11 @@ Returns an `EventEmitter` with these events:
 `S3_KEY=<valid_s3_key> S3_SECRET=<valid_s3_secret> S3_BUCKET=<valid_s3_bucket> npm test`
 
 ## History
+
+### 2.0.0
+
+ * `getPublicUrl` API changed to support bucket regions. Use `getPublicUrlHttp`
+   if you want an insecure URL.
 
 ### 1.3.0
 

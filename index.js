@@ -28,6 +28,7 @@ exports.createClient = function(options) {
 };
 
 exports.getPublicUrl = getPublicUrl;
+exports.getPublicUrlHttp = getPublicUrlHttp;
 
 exports.Client = Client;
 
@@ -191,7 +192,14 @@ Client.prototype.uploadFile = function(params) {
         uploader.emit('progress');
       });
       inStream.pipe(counter);
+      // sometimes AWS SDK decides to call the callback twice :-(
+      var gotCallback = false;
       self.s3.putObject(s3Params, function(err, data) {
+        if (gotCallback) {
+          console.error("Warning: AWS SDK JS called callback twice.");
+          return;
+        }
+        gotCallback = true;
         pendCb();
         if (errorOccurred) return;
         if (err) {
@@ -584,7 +592,10 @@ function syncDir(self, params, directionIsToS3) {
 
   ee.progressTotal = 0;
   ee.progressAmount = 0;
+  ee.progressMd5Amount = 0;
+  ee.progressMd5Total = 0;
   ee.objectsFound = 0;
+  ee.startedTransfer = false;
 
   var pend = new Pend();
   pend.go(findAllS3Objects);
@@ -607,6 +618,7 @@ function syncDir(self, params, directionIsToS3) {
       if (deleteRemoved) pend.go(deleteRemovedLocalFiles);
       pend.go(downloadDifferentObjects);
     }
+    ee.startedTransfer = true;
     ee.emit('progress');
     pend.wait(function(err) {
       if (err) {
@@ -846,6 +858,7 @@ function syncDir(self, params, directionIsToS3) {
         localFiles[relPath] = stat;
         return;
       }
+      ee.progressMd5Total += stat.size;
       pend.go(function(cb) {
         var inStream = fs.createReadStream(file);
         var hash = crypto.createHash('md5');
@@ -860,6 +873,8 @@ function syncDir(self, params, directionIsToS3) {
           stat.path = relPath;
           localFiles[toUnixSep(relPath)] = stat;
           localFilesSize += stat.size;
+          ee.progressMd5Amount += stat.size;
+          ee.emit('progress');
           cb();
         });
         inStream.pipe(hash);
@@ -945,15 +960,21 @@ function encodeSpecialCharacters(filename) {
   });
 }
 
-function ensureLeadingSlash(filename) {
-  return filename[0] !== '/' ? '/' + filename : filename;
+function getPublicUrl(bucket, key, bucketLocation) {
+  var hostnamePrefix = bucketLocation ? ("s3-" + bucketLocation) : "s3";
+  var parts = {
+    protocol: "https:",
+    hostname: hostnamePrefix + ".amazonaws.com",
+    pathname: "/" + bucket + "/" + encodeSpecialCharacters(key),
+  };
+  return url.format(parts);
 }
 
-function getPublicUrl(bucket, key, insecure) {
+function getPublicUrlHttp(bucket, key) {
   var parts = {
-    protocol: insecure ? "http:" : "https:",
-    hostname: "s3.amazonaws.com",
-    pathname: "/" + bucket + encodeSpecialCharacters(ensureLeadingSlash(key)),
+    protocol: "http:",
+    hostname: bucket + ".s3.amazonaws.com",
+    pathname: "/" + encodeSpecialCharacters(key),
   };
   return url.format(parts);
 }
