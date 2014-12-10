@@ -1,6 +1,6 @@
 # High Level Amazon S3 Client
 
-## Features and Limitations
+## Features
 
  * Automatically retry a configurable number of times when S3 returns an error.
  * Includes logic to make multiple requests when there is a 1000 object limit.
@@ -8,10 +8,14 @@
    Retries get pushed to the end of the paralellization queue.
  * Ability to sync a dir to and from S3.
  * Progress reporting.
- * Limited to files less than 5GB.
- * Limited to objects which were not uploaded using a multipart request.
+ * Supports files of any size (up to S3's maximum 5 TB object size limit).
+ * Uploads large files quickly using parallel multipart uploads.
+ * Uses heuristics to compute multipart ETags client-side to avoid uploading
+   or downloading files unnecessarily.
+ * Automatically provide Content-Type for uploads based on file extension.
 
-See also the companion CLI tool, [s3-cli](https://github.com/andrewrk/node-s3-cli).
+See also the companion CLI tool which is meant to be a drop-in replacement for
+s3cmd: [s3-cli](https://github.com/andrewrk/node-s3-cli).
 
 ## Synopsis
 
@@ -21,9 +25,11 @@ See also the companion CLI tool, [s3-cli](https://github.com/andrewrk/node-s3-cl
 var s3 = require('s3');
 
 var client = s3.createClient({
-  maxAsyncS3: Infinity,
-  s3RetryCount: 3,
-  s3RetryDelay: 1000,
+  maxAsyncS3: 20,     // this is the default
+  s3RetryCount: 3,    // this is the default
+  s3RetryDelay: 1000, // this is the default
+  multipartUploadThreshold: 20971520, // this is the default (20 MB)
+  multipartUploadSize: 15728640, // this is the default (15 MB)
   s3Options: {
     accessKeyId: "your s3 key",
     secretAccessKey: "your s3 secret",
@@ -40,8 +46,9 @@ var s3 = require('s3');
 var awsS3Client = new AWS.S3(s3Options);
 var options = {
   s3Client: awsS3Client,
+  // more options available. See API docs below.
 };
-var client = s3.fromAwsSdkS3(options);
+var client = s3.createClient(options);
 ```
 
 ### Upload a file to S3
@@ -124,16 +131,20 @@ uploader.on('end', function() {
 
 ## Tips
 
- * Consider adding [graceful-fs](https://github.com/isaacs/node-graceful-fs) to
-   your application. This will improve performance when using the `uploadDir`
-   and `downloadDir` functions.
- * Consider increasing the ulimit for the number of open files. This will also
-   improve performance when using the `uploadDir` and `downloadDir` functions.
  * Consider increasing the socket pool size in the `http` and `https` global
    agents. This will improve bandwidth when using `uploadDir` and `downloadDir`
-   functions.
+   functions. For example:
+
+   ```js
+   http.globalAgent.maxSockets = https.globalAgent.maxSockets = 20;
+   ```
 
 ## API Documentation
+
+### s3.AWS
+
+This contains a reference to the aws-sdk module. It is a valid use case to use
+both this module and the lower level aws-sdk module in tandem.
 
 ### s3.createClient(options)
 
@@ -142,13 +153,23 @@ Creates an S3 client.
 `options`:
 
  * `s3Client` - optional, an instance of `AWS.S3`. Leave blank if you provide `s3Options`.
- * `s3Options` - optional, provide this if you don't provide `s3Client`.
+ * `s3Options` - optional. leave blank if you provide `s3Client`.
    - See AWS SDK documentation for available options which are passed to `new AWS.S3()`:
      http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/Config.html#constructor-property
  * `maxAsyncS3` - maximum number of simultaneous requests this client will
-   ever have open to S3. defaults to `Infinity`.
+   ever have open to S3. defaults to `20`.
  * `s3RetryCount` - how many times to try an S3 operation before giving up.
- * `s3RetryDelay` - how many milliseconds to wait before retrying an S3 operation.
+   Default 3.
+ * `s3RetryDelay` - how many milliseconds to wait before retrying an S3
+   operation. Default 1000.
+ * `multipartUploadThreshold` - if a file is this many bytes or greater, it
+   will be uploaded via a multipart request. Default is 20MB. Minimum is 5MB.
+   Maximum is 5GB.
+ * `multipartUploadSize` - when uploading via multipart, this is the part size.
+   The minimum size is 5MB. The maximum size is 5GB. Default is 15MB. Note that
+   S3 has a maximum of 10000 parts for a multipart upload, so if this value is
+   too small, it will be ignored in favor of the minimum necessary value
+   required to upload the file.
 
 ### s3.getPublicUrl(bucket, key, [bucketLocation])
 
@@ -192,16 +213,21 @@ See http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/S3.html#putObject-pro
 
  * `s3Params`: params to pass to AWS SDK `putObject`.
  * `localFile`: path to the file on disk you want to upload to S3.
- * `localFileStat`: optional - if you happen to have the stat object from
-   `fs.stat` and the md5sum of the file, you can provide it here. Otherwise it
-   will be computed for you.
+ * (optional) `defaultContentType`: Unless you explicitly set the `ContentType`
+   parameter in `s3Params`, it will be automatically set for you based on the
+   file extension of `localFile`. If the extension is unrecognized,
+   `defaultContentType` will be used instead. Defaults to
+   `application/octet-stream`.
 
 The difference between using AWS SDK `putObject` and this one:
 
  * This works with files, not streams or buffers.
  * If the reported MD5 upon upload completion does not match, it retries.
+ * If the file size is large enough, uses multipart upload to upload parts in
+   parallel.
  * Retry based on the client's retry settings.
  * Progress reporting.
+ * Sets the `ContentType` based on file extension if you do not provide it.
 
 Returns an `EventEmitter` with these properties:
 
@@ -215,10 +241,18 @@ And these events:
  * `'end' (data)` - emitted when the file is uploaded successfully
    - `data` is the same object that you get from `putObject` in AWS SDK
  * `'progress'` - emitted when `progressMd5Amount`, `progressAmount`, and
-   `progressTotal` properties change.
- * `'stream' (stream)` - emitted when a `ReadableStream` for `localFile` has
-   been opened. Be aware that this might fire multiple times if a request to S3
-   must be retried.
+   `progressTotal` properties change. Note that it is possible for progress to
+   go backwards when an upload fails and must be retried.
+ * `'fileOpened' (fdSlicer)` - emitted when `localFile` has been opened. The file
+   is opened with the [fd-slicer](https://github.com/andrewrk/node-fd-slicer)
+   module because we might need to read from multiple locations in the file at
+   the same time. `fdSlicer` is an object for which you can call
+   `createReadStream(options)`. See the fd-slicer README for more information.
+ * `'fileClosed'` - emitted when `localFile` has been closed.
+
+And these methods:
+
+ * `abort()` - call this to stop the find operation.
 
 ### client.downloadFile(params)
 
@@ -244,9 +278,52 @@ Returns an `EventEmitter` with these properties:
 And these events:
 
  * `'error' (err)`
- * `'end'` - emitted when the file is uploaded successfully
+ * `'end'` - emitted when the file is downloaded successfully
  * `'progress'` - emitted when `progressAmount` and `progressTotal`
    properties change.
+
+### client.downloadBuffer(s3Params)
+
+http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/S3.html#getObject-property
+
+ * `s3Params`: params to pass to AWS SDK `getObject`.
+
+The difference between using AWS SDK `getObject` and this one:
+
+ * This works with a buffer only.
+ * If the reported MD5 upon download completion does not match, it retries.
+ * Retry based on the client's retry settings.
+ * Progress reporting.
+
+Returns an `EventEmitter` with these properties:
+
+ * `progressAmount`
+ * `progressTotal`
+
+And these events:
+
+ * `'error' (err)`
+ * `'end' (buffer)` - emitted when the file is downloaded successfully.
+   `buffer` is a `Buffer` containing the object data.
+ * `'progress'` - emitted when `progressAmount` and `progressTotal`
+   properties change.
+
+### client.downloadStream(s3Params)
+
+http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/S3.html#getObject-property
+
+ * `s3Params`: params to pass to AWS SDK `getObject`.
+
+The difference between using AWS SDK `getObject` and this one:
+
+ * This works with a stream only.
+
+If you want retries, progress, or MD5 checking, you must code it yourself.
+
+Returns a `ReadableStream` with these additional events:
+
+ * `'httpHeaders' (statusCode, headers)` - contains the HTTP response
+   headers and status code.
 
 ### client.listObjects(params)
 
@@ -254,9 +331,9 @@ See http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/S3.html#listObjects-p
 
 `params`:
 
- * `recursive` - `true` or `false` whether or not you want to recurse
-   into directories.
  * `s3Params` - params to pass to AWS SDK `listObjects`.
+ * (optional) `recursive` - `true` or `false` whether or not you want to recurse
+   into directories. Default `false`.
 
 Note that if you set `Delimiter` in `s3Params` then you will get a list of
 objects and folders in the directory you specify. You probably do not want to
@@ -270,9 +347,9 @@ be empty string.
 
 The difference between using AWS SDK `listObjects` and this one:
 
- * Retry based on the client's retry settings.
+ * Retries based on the client's retry settings.
  * Supports recursive directory listing.
- * Make multiple requests if the number of objects to list is greater than 1000.
+ * Makes multiple requests if the number of objects to list is greater than 1000.
 
 Returns an `EventEmitter` with these properties:
 
@@ -299,7 +376,7 @@ See http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/S3.html#deleteObjects
 
 `s3Params` are the same.
 
-The difference between using AWS SDK `deleteObjects` and this one is that this one will:
+The difference between using AWS SDK `deleteObjects` and this one:
 
  * Retry based on the client's retry settings.
  * Make multiple requests if the number of objects you want to delete is
@@ -324,13 +401,20 @@ Syncs an entire directory to S3.
 `params`:
 
  * `localDir` - source path on local file system to sync to S3
- * `deleteRemoved` - delete s3 objects with no corresponding local file.
-   default false
- * `getS3Params` - optional function which will be called for every file that
-   needs to be uploaded. See below.
  * `s3Params`
    - `Prefix` (required)
    - `Bucket` (required)
+ * (optional) `deleteRemoved` - delete s3 objects with no corresponding local file.
+   default false
+ * (optional) `getS3Params` - function which will be called for every file that
+   needs to be uploaded. You can use this to skip some files. See below.
+ * (optional) `defaultContentType`: Unless you explicitly set the `ContentType`
+   parameter in `s3Params`, it will be automatically set for you based on the
+   file extension of `localFile`. If the extension is unrecognized,
+   `defaultContentType` will be used instead. Defaults to
+   `application/octet-stream`.
+ * (optional) `followSymlinks` - Set this to `false` to ignore symlinks.
+   Defaults to `true`.
 
 ```js
 function getS3Params(localFile, stat, callback) {
@@ -348,12 +432,40 @@ Returns an `EventEmitter` with these properties:
 
  * `progressAmount`
  * `progressTotal`
+ * `progressMd5Amount`
+ * `progressMd5Total`
+ * `deleteAmount`
+ * `deleteTotal`
+ * `filesFound`
+ * `objectsFound`
+ * `doneFindingFiles`
+ * `doneFindingObjects`
+ * `doneMd5`
 
 And these events:
 
  * `'error' (err)`
  * `'end'` - emitted when all files are uploaded
- * `'progress'` - emitted when the `progressAmount` or `progressTotal` properties change.
+ * `'progress'` - emitted when any of the above progress properties change.
+ * `'fileUploadStart' (localFilePath, s3Key)` - emitted when a file begins
+   uploading.
+ * `'fileUploadEnd' (localFilePath, s3Key)` - emitted when a file successfully
+   finishes uploading.
+
+`uploadDir` works like this:
+
+ 0. Start listing all S3 objects for the target `Prefix`. S3 guarantees
+    returned objects to be in sorted order.
+ 0. Meanwhile, recursively find all files in `localDir`.
+ 0. Once all local files are found, we sort them (the same way that S3 sorts).
+ 0. Next we iterate over the sorted local file list one at a time, computing
+    MD5 sums.
+ 0. Now S3 object listing and MD5 sum computing are happening in parallel. As
+    each operation progresses we compare both sorted lists side-by-side,
+    iterating over them one at a time, uploading files whose MD5 sums don't
+    match the remote object (or the remote object is missing), and, if
+    `deleteRemoved` is set, deleting remote objects whose corresponding local
+    files are missing.
 
 ### client.downloadDir(params)
 
@@ -362,12 +474,15 @@ Syncs an entire directory from S3.
 `params`:
 
  * `localDir` - destination directory on local file system to sync to
- * `deleteRemoved` - delete local files with no corresponding s3 object. default `false`
- * `getS3Params` - optional function which will be called for every object that
-   needs to be downloaded. See below.
  * `s3Params`
    - `Prefix` (required)
    - `Bucket` (required)
+ * (optional) `deleteRemoved` - delete local files with no corresponding s3 object. default `false`
+ * (optional) `getS3Params` - function which will be called for every object that
+   needs to be downloaded. You can use this to skip downloading some objects.
+   See below.
+ * (optional) `followSymlinks` - Set this to `false` to ignore symlinks.
+   Defaults to `true`.
 
 ```js
 function getS3Params(localFile, s3Object, callback) {
@@ -380,7 +495,7 @@ function getS3Params(localFile, s3Object, callback) {
   var s3Params = { // if there is no error
     VersionId: "abcd", // just an example
   };
-  // pass `null` for `s3Params` if you want to skip dowlnoading this object.
+  // pass `null` for `s3Params` if you want to skip downloading this object.
   callback(err, s3Params);
 }
 ```
@@ -389,12 +504,40 @@ Returns an `EventEmitter` with these properties:
 
  * `progressAmount`
  * `progressTotal`
+ * `progressMd5Amount`
+ * `progressMd5Total`
+ * `deleteAmount`
+ * `deleteTotal`
+ * `filesFound`
+ * `objectsFound`
+ * `doneFindingFiles`
+ * `doneFindingObjects`
+ * `doneMd5`
 
 And these events:
 
  * `'error' (err)`
- * `'end'` - emitted when all files are uploaded
- * `'progress'` - emitted when the `progressAmount` or `progressTotal` properties change.
+ * `'end'` - emitted when all files are downloaded
+ * `'progress'` - emitted when any of the progress properties above change
+ * `'fileDownloadStart' (localFilePath, s3Key)` - emitted when a file begins
+   downloading.
+ * `'fileDownloadEnd' (localFilePath, s3Key)` - emitted when a file successfully
+   finishes downloading.
+
+`downloadDir` works like this:
+
+ 0. Start listing all S3 objects for the target `Prefix`. S3 guarantees
+    returned objects to be in sorted order.
+ 0. Meanwhile, recursively find all files in `localDir`.
+ 0. Once all local files are found, we sort them (the same way that S3 sorts).
+ 0. Next we iterate over the sorted local file list one at a time, computing
+    MD5 sums.
+ 0. Now S3 object listing and MD5 sum computing are happening in parallel. As
+    each operation progresses we compare both sorted lists side-by-side,
+    iterating over them one at a time, downloading objects whose MD5 sums don't
+    match the local file (or the local file is missing), and, if
+    `deleteRemoved` is set, deleting local files whose corresponding objects
+    are missing.
 
 ### client.deleteDir(s3Params)
 
@@ -404,7 +547,7 @@ Deletes an entire directory on S3.
 
  * `Bucket`
  * `Prefix`
- * `MFA` (optional)
+ * (optional) `MFA`
 
 Returns an `EventEmitter` with these properties:
 
@@ -417,6 +560,13 @@ And these events:
  * `'end'` - emitted when all objects are deleted.
  * `'progress'` - emitted when the `progressAmount` or `progressTotal` properties change.
 
+`deleteDir` works like this:
+
+ 0. Start listing all objects in a bucket recursively. S3 returns 1000 objects
+    per response.
+ 0. For each response that comes back with a list of objects in the bucket,
+    immediately send a delete request for all of them.
+
 ### client.copyObject(s3Params)
 
 See http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/S3.html#copyObject-property
@@ -424,7 +574,7 @@ See http://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/S3.html#copyObject-pr
 `s3Params` are the same. Don't forget that `CopySource` must contain the
 source bucket name as well as the source key name.
 
-The difference between using AWS SDK `copyObject` and this one will:
+The difference between using AWS SDK `copyObject` and this one:
 
  * Retry based on the client's retry settings.
 
@@ -453,48 +603,5 @@ Returns an `EventEmitter` with these events:
 
 `S3_KEY=<valid_s3_key> S3_SECRET=<valid_s3_secret> S3_BUCKET=<valid_s3_bucket> npm test`
 
-## History
-
-### 2.0.0
-
- * `getPublicUrl` API changed to support bucket regions. Use `getPublicUrlHttp`
-   if you want an insecure URL.
-
-### 1.3.0
-
- * `downloadFile` respects `maxAsyncS3`
- * Add `copyObject` API
- * AWS JS SDK updated to 2.0.0-rc.18
- * errors with `retryable` set to `false` are not retried
- * Add `moveObject` API
- * `uploadFile` emits a `stream` event.
-
-### 1.2.1
-
- * fix `listObjects` for greater than 1000 objects
- * `downloadDir` supports `getS3Params` parameter
- * `uploadDir` and `downloadDir` expose `objectsFound` progress
-
-### 1.2.0
-
- * `uploadDir` accepts `getS3Params` function parameter
-
-### 1.1.1
-
- * fix handling of directory seperator in Windows
- * allow `uploadDir` and `downloadDir` with empty `Prefix`
-
-### 1.1.0
-
- * Add an API function to get the HTTP url to an S3 resource
-
-### 1.0.0
-
- * complete module rewrite
- * depend on official AWS SDK instead of knox
- * support `uploadDir`, `downloadDir`, `listObjects`, `deleteObject`, and `deleteDir`
-
-### 0.3.1
-
- * fix `resp.req.url` sometimes not defined causing crash
- * fix emitting `end` event before write completely finished
+Tests upload and download large amounts of data to and from S3. The test
+timeout is set to 40 seconds because Internet connectivity waries wildly.
